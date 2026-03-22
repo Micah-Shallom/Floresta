@@ -30,7 +30,6 @@ use super::UtreexoNode;
 use crate::address_man::AddressState;
 use crate::address_man::LocalAddress;
 use crate::block_proof::Bitmap;
-use crate::node::running_ctx::RunningNode;
 use crate::node_context::NodeContext;
 use crate::node_context::PeerId;
 use crate::node_interface::NodeResponse;
@@ -459,8 +458,7 @@ where
                         .update_set_state(idx, AddressState::Failed(now));
                 }
                 PeerStatus::Banned => {
-                    self.address_man
-                        .update_set_state(idx, AddressState::Banned(RunningNode::BAN_TIME));
+                    // BanMan already tracks this ban; rearrange_buckets will purge the address
                 }
             }
         }
