@@ -308,6 +308,12 @@ impl Florestad {
         if let Some(chan) = chan {
             try_and_log!(chan.await);
         }
+
+        #[cfg(feature = "json-rpc")]
+        {
+            let cookie_path = self.config.datadir.join(json_rpc::auth::COOKIE_FILE_NAME);
+            try_and_log!(json_rpc::auth::delete_cookie(&cookie_path));
+        }
     }
 
     /// Parses an address in the format `<hostname>[<:port>]` and returns a
@@ -477,6 +483,10 @@ impl Florestad {
         // JSON-RPC
         #[cfg(feature = "json-rpc")]
         {
+            let cookie_path = datadir.join(json_rpc::auth::COOKIE_FILE_NAME);
+            json_rpc::auth::generate_cookie(&cookie_path)?;
+            info!("RPC cookie file written to {}", cookie_path.display());
+
             let server = tokio::spawn(json_rpc::server::RpcImpl::create(
                 blockchain_state.clone(),
                 wallet.clone(),
