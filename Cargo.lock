@@ -1185,6 +1185,8 @@ dependencies = [
  "bitcoin",
  "clap",
  "corepc-types",
+ "dirs",
+ "floresta-common 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "floresta-proc-macro",
  "jsonrpc",
  "rand 0.10.2",
