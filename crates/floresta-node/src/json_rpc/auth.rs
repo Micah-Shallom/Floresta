@@ -13,10 +13,14 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::LazyLock;
+use std::time::Duration;
 
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::extract::Request;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -30,6 +34,7 @@ use bitcoin::hashes::Hmac;
 use bitcoin::hashes::HmacEngine;
 use bitcoin::hashes::sha256;
 use bitcoin::hex::DisplayHex;
+use tokio::sync::Semaphore;
 
 /// Username literal used for cookie auth (Core convention).
 pub(crate) const COOKIE_USER: &str = "__cookie__";
@@ -168,9 +173,11 @@ pub mod basic {
 }
 
 /// Axum middleware gating each request on the configured [`Auth`]. Anything
-/// but a match returns 401 with `WWW-Authenticate` per RFC 7235.
+/// but a match returns 401 with `WWW-Authenticate` per RFC 7235; a
+/// present-but-invalid header also takes [`reject`]'s delay, an absent one not.
 pub(crate) async fn auth_middleware(
     State(creds): State<std::sync::Arc<Auth>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: Request,
     next: Next,
 ) -> Response {
@@ -178,27 +185,36 @@ pub(crate) async fn auth_middleware(
         tracing::debug!("rpc auth header missing; rejecting");
         return unauthorized();
     };
-    let value = match header.to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            tracing::debug!("rpc auth header is not valid ascii; rejecting");
-            return unauthorized();
-        }
+    let Ok(value) = header.to_str() else {
+        tracing::debug!("rpc auth header is not valid ascii; rejecting");
+        return reject().await;
     };
-    let claimed = match basic::Credentials::parse(value) {
-        Ok(creds) => creds,
-        Err(e) => {
-            tracing::debug!("rpc auth header parse failed: {e}; rejecting");
-            return unauthorized();
+    match basic::Credentials::parse(value) {
+        Err(e) => tracing::debug!("rpc auth header parse failed: {e}; rejecting"),
+        Ok(claimed) => {
+            if creds.matches(&claimed.user, &claimed.pass) {
+                tracing::debug!("rpc auth ok for user {}", claimed.user);
+                return next.run(req).await;
+            }
+            tracing::warn!("incorrect password attempt from {peer}");
         }
-    };
-    if !creds.matches(&claimed.user, &claimed.pass) {
-        let user = &claimed.user;
-        tracing::debug!("rpc auth credentials mismatched for user {user}; rejecting");
-        return unauthorized();
     }
-    tracing::debug!("rpc auth ok for user {}", claimed.user);
-    next.run(req).await
+    reject().await
+}
+
+/// Concurrent rejections allowed to sleep at once. Core caps failures the same
+/// way, by blocking one of its 16 HTTP workers; an async sleep blocks nothing.
+const REJECT_SLOTS: usize = 16;
+
+static REJECT_LIMIT: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(REJECT_SLOTS));
+
+/// 250 ms delay before the 401, matching Core, for present-but-invalid headers
+/// only. The permit is held across the sleep, capping failures at roughly
+/// `REJECT_SLOTS / 250 ms`; successful auth never takes one.
+async fn reject() -> Response {
+    let _permit = REJECT_LIMIT.acquire().await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    unauthorized()
 }
 
 fn unauthorized() -> Response {
@@ -775,6 +791,29 @@ mod tests {
         assert_eq!(
             RpcAuth::parse("user:salt$"),
             Err(RpcAuthParseError::EmptyField)
+        );
+    }
+
+    #[tokio::test]
+    /// The permit must be held across the sleep, not dropped immediately.
+    /// With `REJECT_SLOTS` permits, one extra rejection cannot start until an
+    /// earlier one finishes, so `REJECT_SLOTS + 1` takes at least two rounds.
+    /// A lower bound only fails if the cap is gone, so load cannot flake it.
+    async fn reject_caps_concurrent_attempts() {
+        let start = std::time::Instant::now();
+
+        let mut set = Vec::with_capacity(REJECT_SLOTS + 1);
+        for _ in 0..=REJECT_SLOTS {
+            set.push(tokio::spawn(reject()));
+        }
+        for handle in set {
+            handle.await.expect("reject should not panic");
+        }
+
+        assert!(
+            start.elapsed() >= Duration::from_millis(500),
+            "one extra attempt should wait for a free permit, took {:?}",
+            start.elapsed()
         );
     }
 
